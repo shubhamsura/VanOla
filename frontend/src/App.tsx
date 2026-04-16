@@ -1065,3 +1065,5 @@ function App() {
 export default App;
 
 // Fix: Safari Geolocation permission click gesture fix
+
+// Background audio wake lock active
