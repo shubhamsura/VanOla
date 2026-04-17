@@ -249,3 +249,5 @@ setInterval(() => {
 server.listen(PORT, () => {
   console.log(`VanOla Server running on port ${PORT}`);
 });
+
+// Grace period active on disconnections
