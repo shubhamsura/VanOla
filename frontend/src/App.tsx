@@ -10,7 +10,9 @@ import {
   Copy,
   Check,
   Search,
-  AlertCircle
+  AlertCircle,
+  GripVertical,
+  Pencil
 } from 'lucide-react';
 import { useSocket } from './hooks/useSocket';
 import type { Stop } from './hooks/useSocket';
@@ -65,11 +67,15 @@ function App() {
 
   // Track session details
   const [driverCode, setDriverCode] = useState<string>('');
+  const [driverToken, setDriverToken] = useState<string>('');
   const [studentCodeInput, setStudentCodeInput] = useState<string>('');
   const [isCopied, setIsCopied] = useState(false);
   
   // Driver settings
   const [stops, setStops] = useState<Stop[]>([]);
+  const [draggedStopIndex, setDraggedStopIndex] = useState<number | null>(null);
+  const [editingStopId, setEditingStopId] = useState<string | null>(null);
+  const [editingStopName, setEditingStopName] = useState<string>('');
   const [newStopName, setNewStopName] = useState('');
   const [isStopAddingMode, setIsStopAddingMode] = useState(false);
   const [simulationMode, setSimulationMode] = useState(false); // Default to false so real live GPS is active by default
@@ -98,6 +104,7 @@ function App() {
   useEffect(() => {
     setSessionError(null);
     setDriverCode('');
+    setDriverToken('');
     setStudentCodeInput('');
 
     if (role) {
@@ -114,9 +121,9 @@ function App() {
   // Auto re-join session room when socket reconnects
   useEffect(() => {
     if (isConnected && driverCode && role) {
-      joinSession(driverCode, role);
+      joinSession(driverCode, role, role === 'driver' ? driverToken : undefined);
     }
-  }, [isConnected, driverCode, role, joinSession]);
+  }, [isConnected, driverCode, role, driverToken, joinSession]);
 
   // Keep sending GPS coordinates to socket when tracking is active
   useEffect(() => {
@@ -142,14 +149,14 @@ function App() {
         return; // Coordinates not ready
       }
 
-      updateLocation(driverCode, lat, lng, speed, stops);
+      updateLocation(driverCode, lat, lng, speed, stops, driverToken);
     };
 
     sendUpdate();
     updateInterval = setInterval(sendUpdate, 2000);
 
     return () => clearInterval(updateInterval);
-  }, [isWatching, simulationMode, simulatedLocation, geoLat, geoLng, geoSpeed, driverCode, stops, updateLocation]);
+  }, [isWatching, simulationMode, simulatedLocation, geoLat, geoLng, geoSpeed, driverCode, stops, driverToken, updateLocation]);
 
   // Sync stops from server session state
   useEffect(() => {
@@ -214,9 +221,13 @@ function App() {
       const session = await createSession(stops);
       if (session) {
         const generatedCode = session.driverCode;
+        const token = session.driverToken || '';
         setDriverCode(generatedCode);
-        setIsDrawerOpen(false); // Collapse drawer to show full map initially
-        joinSession(generatedCode, 'driver');
+        setDriverToken(token);
+        if (window.innerWidth <= 768) {
+          setIsDrawerOpen(false); // Collapse drawer on mobile to show full map initially
+        }
+        joinSession(generatedCode, 'driver', token);
         
         // 3. Play silent audio in loop (audio wake lock) to prevent mobile OS from suspending execution in the background
         try {
@@ -250,8 +261,9 @@ function App() {
   const handleStopTrip = () => {
     if (!driverCode) return;
     stopWatching();
-    stopSession(driverCode);
+    stopSession(driverCode, driverToken);
     setDriverCode('');
+    setDriverToken('');
     setSimulatedLocation(null);
     setStops([]);
     setMapCenterOverride(null);
@@ -396,9 +408,116 @@ function App() {
       fetch(`${BACKEND_URL}/api/sessions/${driverCode}/stops`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stops: updatedStops })
+        body: JSON.stringify({ stops: updatedStops, driverToken })
       });
     }
+  };
+
+  // Stop renaming handlers
+  const handleStartRenameStop = (stop: Stop) => {
+    setEditingStopId(stop.id);
+    setEditingStopName(stop.name);
+  };
+
+  const handleSaveRenameStop = (stopId: string) => {
+    if (!editingStopName.trim()) {
+      setEditingStopId(null);
+      return;
+    }
+
+    const updatedStops = stops.map((s) => (s.id === stopId ? { ...s, name: editingStopName.trim() } : s));
+    setStops(updatedStops);
+    setEditingStopId(null);
+    setEditingStopName('');
+
+    if (driverCode) {
+      fetch(`${BACKEND_URL}/api/sessions/${driverCode}/stops`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stops: updatedStops, driverToken }),
+      }).catch((err) => console.error('Failed to save stop rename:', err));
+    }
+  };
+
+  // Drag & Drop stop reordering
+  const handleDragStart = (e: React.DragEvent<HTMLDivElement>, index: number) => {
+    setDraggedStopIndex(index);
+    e.dataTransfer.effectAllowed = 'move';
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>, targetIndex: number) => {
+    e.preventDefault();
+    if (draggedStopIndex === null || draggedStopIndex === targetIndex) return;
+
+    const updatedStops = [...stops];
+    const [movedStop] = updatedStops.splice(draggedStopIndex, 1);
+    updatedStops.splice(targetIndex, 0, movedStop);
+
+    setStops(updatedStops);
+    setDraggedStopIndex(null);
+
+    if (driverCode) {
+      fetch(`${BACKEND_URL}/api/sessions/${driverCode}/stops`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stops: updatedStops, driverToken })
+      }).catch((err) => console.error(err));
+    }
+  };
+
+  const handleDragEnd = () => {
+    setDraggedStopIndex(null);
+  };
+
+  // Touch Drag & Drop reordering for mobile touchscreens
+  const touchStartY = useRef<number | null>(null);
+  const touchStartIndex = useRef<number | null>(null);
+
+  const handleTouchStart = (index: number, e: React.TouchEvent) => {
+    touchStartY.current = e.touches[0].clientY;
+    touchStartIndex.current = index;
+    setDraggedStopIndex(index);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (touchStartIndex.current === null || touchStartY.current === null) return;
+    const currentY = e.touches[0].clientY;
+    const element = document.elementFromPoint(e.touches[0].clientX, currentY);
+    if (!element) return;
+
+    const stopItem = element.closest('.stop-item');
+    if (stopItem) {
+      const targetIdxAttr = stopItem.getAttribute('data-index');
+      if (targetIdxAttr !== null) {
+        const targetIndex = parseInt(targetIdxAttr, 10);
+        if (!isNaN(targetIndex) && targetIndex !== touchStartIndex.current) {
+          const updatedStops = [...stops];
+          const [movedStop] = updatedStops.splice(touchStartIndex.current, 1);
+          updatedStops.splice(targetIndex, 0, movedStop);
+          setStops(updatedStops);
+          touchStartIndex.current = targetIndex;
+
+          if (driverCode) {
+            fetch(`${BACKEND_URL}/api/sessions/${driverCode}/stops`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ stops: updatedStops, driverToken })
+            }).catch((err) => console.error(err));
+          }
+        }
+      }
+    }
+  };
+
+  const handleTouchEnd = () => {
+    touchStartY.current = null;
+    touchStartIndex.current = null;
+    setDraggedStopIndex(null);
   };
 
   // Map clicks
@@ -734,19 +853,74 @@ function App() {
 
                     {stops.length > 0 && (
                       <div className="stops-list-container" style={{ borderTop: '1px solid var(--border-card)', paddingTop: '1rem', marginTop: '1rem' }}>
-                        <span className="input-label">Stops List</span>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                          <span className="input-label" style={{ marginBottom: 0 }}>Declared Route Stops ({stops.length})</span>
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Hold & drag to reorder</span>
+                        </div>
                         {stops.map((stop, idx) => (
-                          <div key={stop.id} className="stop-item">
+                          <div 
+                            key={stop.id} 
+                            data-index={idx}
+                            className={`stop-item ${draggedStopIndex === idx ? 'dragging' : ''}`}
+                            draggable={true}
+                            onDragStart={(e) => handleDragStart(e, idx)}
+                            onDragOver={handleDragOver}
+                            onDrop={(e) => handleDrop(e, idx)}
+                            onDragEnd={handleDragEnd}
+                            onTouchStart={(e) => handleTouchStart(idx, e)}
+                            onTouchMove={handleTouchMove}
+                            onTouchEnd={handleTouchEnd}
+                          >
                             <div className="stop-info">
+                              <span className="stop-drag-handle" title="Hold & Drag to reorder">
+                                <GripVertical size={16} />
+                              </span>
                               <span className="stop-number">{idx + 1}</span>
                               <div>
-                                <div className="stop-name">{stop.name}</div>
+                                {editingStopId === stop.id ? (
+                                  <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }} onClick={(e) => e.stopPropagation()}>
+                                    <input
+                                      type="text"
+                                      className="text-input"
+                                      style={{ padding: '0.2rem 0.4rem', fontSize: '0.85rem', width: '130px' }}
+                                      value={editingStopName}
+                                      onChange={(e) => setEditingStopName(e.target.value)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') handleSaveRenameStop(stop.id);
+                                        if (e.key === 'Escape') setEditingStopId(null);
+                                      }}
+                                      autoFocus
+                                    />
+                                    <button
+                                      className="btn btn-secondary"
+                                      style={{ padding: '0.2rem 0.4rem', fontSize: '0.75rem' }}
+                                      onClick={() => handleSaveRenameStop(stop.id)}
+                                    >
+                                      <Check size={14} />
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                                    <div className="stop-name">{stop.name}</div>
+                                    <button
+                                      className="stop-edit-btn"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleStartRenameStop(stop);
+                                      }}
+                                      title="Rename Stop"
+                                      style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
+                                    >
+                                      <Pencil size={13} />
+                                    </button>
+                                  </div>
+                                )}
                                 <div className="stop-coordinates">
                                   {stop.lat.toFixed(4)}, {stop.lng.toFixed(4)}
                                 </div>
                               </div>
                             </div>
-                            <button className="stop-delete-btn" onClick={() => handleDeleteStop(stop.id)}>
+                            <button className="stop-delete-btn" onClick={() => handleDeleteStop(stop.id)} title="Delete Stop">
                               <Trash2 size={16} />
                             </button>
                           </div>
@@ -867,7 +1041,12 @@ function App() {
                 {driverCode && currentSessionState && (
                   <div className="glass-card">
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-                      <h3>Stops & Live ETAs</h3>
+                      <div>
+                        <h3 style={{ margin: 0 }}>Van Pickup Sequence & Live ETAs</h3>
+                        <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                          Visiting stops in sequence (#1 → #2 → #3)
+                        </span>
+                      </div>
                       <button className="btn btn-outline" style={{ padding: '0.4rem' }} onClick={() => fetchSessionState(driverCode)}>
                         <RefreshCw size={14} />
                       </button>
@@ -903,13 +1082,18 @@ function App() {
                           }
 
                           return (
-                            <div key={stop.id} className="stop-item">
+                            <div key={stop.id} className="stop-item" style={{ borderLeft: idx === 0 ? '3px solid var(--primary)' : '1px solid var(--border-card)' }}>
                               <div className="stop-info">
-                                <span className="stop-number" style={{ background: 'var(--secondary-glow)', color: 'var(--secondary)' }}>
-                                  {idx + 1}
-                                </span>
+                                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                                  <span className="stop-number" style={{ background: idx === 0 ? 'var(--primary)' : 'rgba(99, 102, 241, 0.15)', color: idx === 0 ? '#fff' : 'var(--primary)', fontWeight: 700 }}>
+                                    {idx + 1}
+                                  </span>
+                                  <span style={{ fontSize: '0.65rem', color: idx === 0 ? 'var(--primary)' : 'var(--text-muted)', fontWeight: 700, marginTop: '2px' }}>
+                                    {idx === 0 ? 'NEXT' : `#${idx + 1}`}
+                                  </span>
+                                </div>
                                 <div>
-                                  <div className="stop-name">{stop.name}</div>
+                                  <div className="stop-name" style={{ fontWeight: idx === 0 ? 700 : 500 }}>{stop.name}</div>
                                   {distanceToVan !== null && (
                                     <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
                                       Distance: {distanceToVan.toFixed(2)} km
@@ -1000,6 +1184,7 @@ function App() {
               onAddStop={handleMapClick}
               enableStopAdding={role === 'driver' && (isStopAddingMode || simulationMode)}
               mapCenterOverride={mapCenterOverride}
+              onClearCenterOverride={() => setMapCenterOverride(null)}
               searchResults={searchResults}
               onSelectSearchResult={selectSearchResult}
               mapStyle={mapStyle}
@@ -1063,9 +1248,3 @@ function App() {
 }
 
 export default App;
-
-// Fix: Safari Geolocation permission click gesture fix
-
-// Background audio wake lock active
-
-// Local GPS state fallback for driver map icon

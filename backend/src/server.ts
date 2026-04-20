@@ -3,17 +3,44 @@ import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
 
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+// Security Headers
+app.use(helmet());
+
+// Restrict CORS origins (Allow environment specified frontend or allow all for local testing)
+const allowedOrigin = process.env.FRONTEND_URL || '*';
+app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
+
+// General API rate limiter to protect against DoS attacks
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 150, // limit each IP to 150 requests per window
+  message: { error: 'Too many requests from this IP, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Strict rate limiter for creating new driver sessions
+const createSessionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 30, // limit to 30 session creations per hour per IP
+  message: { error: 'Too many session creation attempts. Please try again later.' },
+});
+
+app.use('/api/', apiLimiter);
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: allowedOrigin,
     methods: ['GET', 'POST'],
   },
 });
@@ -37,6 +64,7 @@ interface Stop {
 
 interface Session {
   driverCode: string;
+  driverToken: string; // Secret authorization token for the session driver
   status: 'active' | 'inactive';
   driverSocketId?: string;
   stops: Stop[];
@@ -48,7 +76,6 @@ interface Session {
 let sessions: Record<string, Session> = {};
 
 // Helper to generate a human-readable, unique driver code (VIT-XXXX)
-// Excludes ambiguous characters (0, O, 1, I, etc.)
 function generateDriverCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let attempts = 0;
@@ -60,7 +87,6 @@ function generateDriverCode(): string {
     }
     const code = `VIT-${randomPart}`;
     
-    // Ensure uniqueness among active/inactive sessions
     if (!sessions[code]) {
       return code;
     }
@@ -69,14 +95,22 @@ function generateDriverCode(): string {
   return `VIT-${Date.now().toString().slice(-4)}`;
 }
 
+// Helper to strip sensitive server-only fields before sending to public clients
+function toPublicSession(session: Session) {
+  const { driverToken, ...publicData } = session;
+  return publicData;
+}
+
 // REST APIs
 // Create a new tracking session (called by driver when starting a ride)
-app.post('/api/sessions', (req, res) => {
+app.post('/api/sessions', createSessionLimiter, (req, res) => {
   const { stops } = req.body;
   const driverCode = generateDriverCode();
+  const driverToken = crypto.randomBytes(16).toString('hex');
   
   const newSession: Session = {
     driverCode,
+    driverToken,
     status: 'inactive', // becomes active once socket joins
     stops: stops || [],
     createdAt: Date.now(),
@@ -84,10 +118,11 @@ app.post('/api/sessions', (req, res) => {
   
   sessions[driverCode] = newSession;
   console.log(`Created new session: ${driverCode}`);
+  // Return full session including driverToken ONLY to the creator (driver)
   res.status(201).json(newSession);
 });
 
-// Fetch info for a specific driver code
+// Fetch public info for a specific driver code
 app.get('/api/sessions/:driverCode', (req, res) => {
   const { driverCode } = req.params;
   const upperCode = driverCode.toUpperCase();
@@ -96,13 +131,13 @@ app.get('/api/sessions/:driverCode', (req, res) => {
   if (!session) {
     return res.status(404).json({ error: 'Driver code not found' });
   }
-  res.json(session);
+  res.json(toPublicSession(session));
 });
 
 // Update stops for a session dynamically
 app.post('/api/sessions/:driverCode/stops', (req, res) => {
   const { driverCode } = req.params;
-  const { stops } = req.body;
+  const { stops, driverToken } = req.body;
   const upperCode = driverCode.toUpperCase();
   
   const session = sessions[upperCode];
@@ -110,8 +145,12 @@ app.post('/api/sessions/:driverCode/stops', (req, res) => {
     return res.status(404).json({ error: 'Session not found' });
   }
   
+  if (session.driverToken && session.driverToken !== driverToken) {
+    return res.status(403).json({ error: 'Unauthorized: Invalid driver token' });
+  }
+  
   session.stops = stops || [];
-  res.json(session);
+  res.json(toPublicSession(session));
 });
 
 // WebSockets (Real-Time Communication)
@@ -119,7 +158,7 @@ io.on('connection', (socket) => {
   console.log(`Socket connected: ${socket.id}`);
 
   // Client joins a driver code session room
-  socket.on('join-session', ({ driverCode, role }) => {
+  socket.on('join-session', ({ driverCode, role, driverToken }) => {
     const upperCode = driverCode.toUpperCase();
     socket.join(upperCode);
     console.log(`Socket ${socket.id} joined room ${upperCode} as ${role}`);
@@ -127,31 +166,38 @@ io.on('connection', (socket) => {
     const session = sessions[upperCode];
     if (session) {
       if (role === 'driver') {
+        // Authenticate driver token if present
+        if (session.driverToken && driverToken && session.driverToken !== driverToken) {
+          console.warn(`Unauthorized driver join attempt for ${upperCode}`);
+          socket.emit('session-error', { message: 'Unauthorized driver token.' });
+          return;
+        }
+        
         session.status = 'active';
         session.driverSocketId = socket.id;
         
-        // Clear grace period timeout if driver reconnects
         if ((session as any).disconnectTimeoutId) {
           clearTimeout((session as any).disconnectTimeoutId);
           (session as any).disconnectTimeoutId = undefined;
           console.log(`Driver reconnected to session ${upperCode}. Grace period canceled.`);
         }
       }
-      // Send the current session state to the joining socket (especially for late-joining students)
-      socket.emit('session-state', session);
+      // Send the current session state to the joining socket
+      socket.emit('session-state', toPublicSession(session));
       // Alert room of update
-      io.to(upperCode).emit('session-updated', session);
+      io.to(upperCode).emit('session-updated', toPublicSession(session));
     } else {
-      // If code was not registered via HTTP yet, register a basic one on the fly
       if (role === 'driver') {
+        const token = driverToken || crypto.randomBytes(16).toString('hex');
         sessions[upperCode] = {
           driverCode: upperCode,
+          driverToken: token,
           status: 'active',
           driverSocketId: socket.id,
           stops: [],
           createdAt: Date.now(),
         };
-        socket.emit('session-state', sessions[upperCode]);
+        socket.emit('session-state', toPublicSession(sessions[upperCode]));
       } else {
         socket.emit('session-error', { message: 'Invalid Driver Code. Please verify.' });
       }
@@ -159,19 +205,25 @@ io.on('connection', (socket) => {
   });
 
   // Driver broadcasts updated coordinates
-  socket.on('update-location', ({ driverCode, lat, lng, speed, stops }) => {
+  socket.on('update-location', ({ driverCode, driverToken, lat, lng, speed, stops }) => {
     const upperCode = driverCode.toUpperCase();
     const session = sessions[upperCode];
     
-    console.log(`Location update for ${upperCode}: lat=${lat}, lng=${lng}`);
-    const locationData: Location = {
-      lat,
-      lng,
-      speed,
-      timestamp: Date.now(),
-    };
-
     if (session) {
+      // Verify driver token to prevent location spoofing
+      if (session.driverToken && session.driverToken !== driverToken) {
+        console.warn(`Location spoofing attempt rejected for session ${upperCode}`);
+        return;
+      }
+
+      console.log(`Location update for ${upperCode}: lat=${lat}, lng=${lng}`);
+      const locationData: Location = {
+        lat,
+        lng,
+        speed,
+        timestamp: Date.now(),
+      };
+
       session.status = 'active';
       session.lastLocation = locationData;
       session.driverSocketId = socket.id;
@@ -179,51 +231,47 @@ io.on('connection', (socket) => {
         session.stops = stops;
       }
       
-      // Clear grace period timeout if location updates keep coming in
       if ((session as any).disconnectTimeoutId) {
         clearTimeout((session as any).disconnectTimeoutId);
         (session as any).disconnectTimeoutId = undefined;
         console.log(`Driver updated location for session ${upperCode}. Grace period canceled.`);
       }
-    }
 
-    // Broadcast the updated telemetry to students listening in the room
-    socket.to(upperCode).emit('location-updated', {
-      driverCode: upperCode,
-      location: locationData,
-      stops: session?.stops || stops,
-    });
+      // Broadcast the updated telemetry to students listening in the room
+      socket.to(upperCode).emit('location-updated', {
+        driverCode: upperCode,
+        location: locationData,
+        stops: session.stops || stops,
+      });
+    }
   });
 
   // Driver stops the ride
-  socket.on('stop-session', ({ driverCode }) => {
+  socket.on('stop-session', ({ driverCode, driverToken }) => {
     const upperCode = driverCode.toUpperCase();
-    console.log(`Driver stopped session: ${upperCode}`);
     const session = sessions[upperCode];
     
     if (session) {
+      if (session.driverToken && session.driverToken !== driverToken) {
+        return;
+      }
       session.status = 'inactive';
       session.driverSocketId = undefined;
     }
     
     // Broadcast end of ride
     socket.to(upperCode).emit('session-stopped', { driverCode: upperCode });
-    
-    // Clean up from memory to keep store tidy (or preserve for history)
-    // For now we keep it so students can see the offline state, but clean up after 2 hours
   });
 
   // Handle sudden disconnections (e.g. signal drops or tab closes)
   socket.on('disconnect', () => {
     console.log(`Socket disconnected: ${socket.id}`);
     
-    // Check if this socket belonged to a driver
     for (const code in sessions) {
       const session = sessions[code];
       if (session.driverSocketId === socket.id) {
         console.log(`Driver disconnected abruptly from session ${code}. Waiting 35s grace period...`);
         
-        // Wait 35 seconds before declaring offline, to handle phone calls or background switching
         (session as any).disconnectTimeoutId = setTimeout(() => {
           console.log(`Grace period expired. Marking session ${code} as inactive.`);
           session.status = 'inactive';
@@ -244,10 +292,9 @@ setInterval(() => {
       delete sessions[code];
     }
   }
-}, 60 * 60 * 1000); // run every hour
+}, 60 * 60 * 1000);
 
 server.listen(PORT, () => {
   console.log(`VanOla Server running on port ${PORT}`);
 });
 
-// Grace period active on disconnections

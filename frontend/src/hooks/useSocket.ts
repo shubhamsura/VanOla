@@ -19,6 +19,7 @@ interface Stop {
 
 interface Session {
   driverCode: string;
+  driverToken?: string;
   status: 'active' | 'inactive';
   stops: Stop[];
   lastLocation?: Location;
@@ -114,19 +115,20 @@ export const useSocket = () => {
   }, [onLocationUpdateCallback, onSessionStoppedCallback]);
 
   // Join a driver code session room
-  const joinSession = useCallback((driverCode: string, role: 'driver' | 'student') => {
+  const joinSession = useCallback((driverCode: string, role: 'driver' | 'student', driverToken?: string) => {
     if (socketRef.current && isConnected) {
       const upperCode = driverCode.toUpperCase();
-      socketRef.current.emit('join-session', { driverCode: upperCode, role });
+      socketRef.current.emit('join-session', { driverCode: upperCode, role, driverToken });
     }
   }, [isConnected]);
 
   // Send driver coordinates
-  const updateLocation = useCallback((driverCode: string, lat: number, lng: number, speed?: number | null, stops?: Stop[]) => {
+  const updateLocation = useCallback((driverCode: string, lat: number, lng: number, speed?: number | null, stops?: Stop[], driverToken?: string) => {
     if (socketRef.current && isConnected) {
       const upperCode = driverCode.toUpperCase();
       socketRef.current.emit('update-location', {
         driverCode: upperCode,
+        driverToken,
         lat,
         lng,
         speed: speed || undefined,
@@ -136,10 +138,10 @@ export const useSocket = () => {
   }, [isConnected]);
 
   // Stop tracking session
-  const stopSession = useCallback((driverCode: string) => {
+  const stopSession = useCallback((driverCode: string, driverToken?: string) => {
     if (socketRef.current && isConnected) {
       const upperCode = driverCode.toUpperCase();
-      socketRef.current.emit('stop-session', { driverCode: upperCode });
+      socketRef.current.emit('stop-session', { driverCode: upperCode, driverToken });
       setCurrentSessionState(null);
     }
   }, [isConnected]);

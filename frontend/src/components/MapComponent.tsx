@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, useMap, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { Stop, Location } from '../hooks/useSocket';
@@ -18,36 +18,25 @@ const createVanIcon = () => {
         align-items: center;
         justify-content: center;
         box-shadow: 0 0 15px rgba(99, 102, 241, 0.6);
-        position: relative;
+        animation: van-glow-pulse 2s infinite;
       ">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M14 18H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v4"></path>
           <path d="M14 6v12"></path>
           <circle cx="7.5" cy="18.5" r="2.5"></circle>
           <circle cx="16.5" cy="18.5" r="2.5"></circle>
           <path d="M18 16h4v-3h-4Z"></path>
         </svg>
-        <div style="
-          position: absolute;
-          width: 48px;
-          height: 48px;
-          border-radius: 50%;
-          border: 2px solid #6366f1;
-          animation: map-pulse 2s infinite ease-out;
-          opacity: 0.8;
-          top: -9px;
-          left: -9px;
-          pointer-events: none;
-        "></div>
       </div>
       <style>
-        @keyframes map-pulse {
-          0% { transform: scale(0.6); opacity: 1; }
-          100% { transform: scale(1.2); opacity: 0; }
+        @keyframes van-glow-pulse {
+          0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.8); }
+          70% { box-shadow: 0 0 0 14px rgba(99, 102, 241, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
         }
       </style>
     `,
-    className: 'custom-leaflet-icon',
+    className: 'custom-van-icon',
     iconSize: [36, 36],
     iconAnchor: [18, 18],
   });
@@ -73,7 +62,7 @@ const createStopIcon = (number: number) => {
         ${number}
       </div>
     `,
-    className: 'custom-leaflet-icon',
+    className: 'custom-stop-icon',
     iconSize: [28, 28],
     iconAnchor: [14, 14],
   });
@@ -83,31 +72,26 @@ const createStudentIcon = () => {
   return L.divIcon({
     html: `
       <div style="
-        width: 18px;
-        height: 18px;
+        width: 20px;
+        height: 20px;
         background: #0ea5e9;
         border: 2.5px solid #ffffff;
         border-radius: 50%;
         box-shadow: 0 0 10px rgba(14, 165, 233, 0.8);
-        position: relative;
+        animation: student-glow-pulse 2s infinite;
       ">
-        <div style="
-          position: absolute;
-          width: 30px;
-          height: 30px;
-          border-radius: 50%;
-          border: 1.5px solid #0ea5e9;
-          animation: map-pulse 2s infinite ease-out;
-          opacity: 0.6;
-          top: -8.5px;
-          left: -8.5px;
-          pointer-events: none;
-        "></div>
       </div>
+      <style>
+        @keyframes student-glow-pulse {
+          0% { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.8); }
+          70% { box-shadow: 0 0 0 10px rgba(14, 165, 233, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0); }
+        }
+      </style>
     `,
-    className: 'custom-leaflet-icon',
-    iconSize: [18, 18],
-    iconAnchor: [9, 9],
+    className: 'custom-student-icon',
+    iconSize: [20, 20],
+    iconAnchor: [10, 10],
   });
 };
 
@@ -131,7 +115,7 @@ const createSearchMarkerIcon = () => {
         </svg>
       </div>
     `,
-    className: 'custom-leaflet-icon',
+    className: 'custom-search-icon',
     iconSize: [24, 24],
     iconAnchor: [12, 12],
   });
@@ -140,34 +124,53 @@ const createSearchMarkerIcon = () => {
 // Component to handle auto-centering when coordinates change
 interface CenterHandlerProps {
   center: [number, number] | null;
-  shouldCenter: boolean;
   vanLocation: Location | null;
+  onUserInteract?: () => void;
 }
 
-const ChangeMapView: React.FC<CenterHandlerProps> = ({ center, shouldCenter, vanLocation }) => {
+const ChangeMapView: React.FC<CenterHandlerProps> = ({ center, vanLocation, onUserInteract }) => {
   const map = useMap();
-  const [hasCenteredOnce, setHasCenteredOnce] = React.useState(false);
+  const lastCenterRef = React.useRef<string | null>(null);
+  const [hasCenteredOnVan, setHasCenteredOnVan] = React.useState(false);
 
   useEffect(() => {
     if (!vanLocation) {
-      setHasCenteredOnce(false);
+      setHasCenteredOnVan(false);
     }
   }, [vanLocation]);
 
-  useEffect(() => {
-    if (center && shouldCenter) {
-      map.flyTo(center, 15, { animate: true, duration: 1.5 });
-    } else if (vanLocation && !hasCenteredOnce) {
-      map.flyTo([vanLocation.lat, vanLocation.lng], 15, { animate: true, duration: 1.5 });
-      setHasCenteredOnce(true);
+  // Listen for user manual drag/zoom/move gestures to release camera lock
+  useMapEvents({
+    dragstart() {
+      if (onUserInteract) onUserInteract();
+    },
+    zoomstart() {
+      if (onUserInteract) onUserInteract();
+    },
+    movestart() {
+      if (onUserInteract) onUserInteract();
     }
-  }, [center, shouldCenter, vanLocation, hasCenteredOnce, map]);
+  });
+
+  // Smoothly set map view ONLY when center coordinates change to a new location
+  useEffect(() => {
+    if (center) {
+      const centerKey = `${center[0].toFixed(5)},${center[1].toFixed(5)}`;
+      if (lastCenterRef.current !== centerKey) {
+        lastCenterRef.current = centerKey;
+        map.setView(center, Math.max(map.getZoom(), 15), { animate: true });
+      }
+    } else if (vanLocation && !hasCenteredOnVan) {
+      map.setView([vanLocation.lat, vanLocation.lng], 15, { animate: true });
+      setHasCenteredOnVan(true);
+    }
+  }, [center, vanLocation, hasCenteredOnVan, map]);
 
   return null;
 };
 
 // Custom floating map button to re-center on the van manually
-const MapControls: React.FC<{ vanLocation: Location | null }> = ({ vanLocation }) => {
+const MapControls: React.FC<{ vanLocation: Location | null; onCenterVan?: () => void }> = ({ vanLocation, onCenterVan }) => {
   const map = useMap();
   if (!vanLocation) return null;
   
@@ -196,7 +199,8 @@ const MapControls: React.FC<{ vanLocation: Location | null }> = ({ vanLocation }
       onClick={(e) => {
         e.stopPropagation();
         e.preventDefault();
-        map.flyTo([vanLocation.lat, vanLocation.lng], Math.max(map.getZoom(), 15), { animate: true, duration: 1.2 });
+        if (onCenterVan) onCenterVan();
+        map.setView([vanLocation.lat, vanLocation.lng], Math.max(map.getZoom(), 15), { animate: true });
       }}
     >
       🎯 Center on Van
@@ -228,6 +232,7 @@ interface MapComponentProps {
   onAddStop?: (lat: number, lng: number) => void;
   enableStopAdding?: boolean;
   mapCenterOverride?: [number, number] | null;
+  onClearCenterOverride?: () => void;
   searchResults?: any[];
   onSelectSearchResult?: (result: any) => void;
   mapStyle?: 'roadmap' | 'satellite';
@@ -240,6 +245,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   onAddStop,
   enableStopAdding = false,
   mapCenterOverride = null,
+  onClearCenterOverride,
   searchResults = [],
   onSelectSearchResult,
   mapStyle = 'roadmap',
@@ -255,7 +261,47 @@ export const MapComponent: React.FC<MapComponentProps> = ({
 
   const centerCoords = getInitialCenter();
 
+  const [roadPolylinePositions, setRoadPolylinePositions] = React.useState<[number, number][]>([]);
 
+  // Fetch actual driving road coordinates from OSRM routing engine (Google Maps style road tracing)
+  useEffect(() => {
+    const points: { lat: number; lng: number }[] = [];
+    if (vanLocation) {
+      points.push({ lat: vanLocation.lat, lng: vanLocation.lng });
+    }
+    stops.forEach((s) => points.push({ lat: s.lat, lng: s.lng }));
+
+    if (points.length < 2) {
+      setRoadPolylinePositions([]);
+      return;
+    }
+
+    const fallbackStraight: [number, number][] = points.map((p) => [p.lat, p.lng]);
+
+    // Format OSRM coordinates: lon,lat;lon,lat...
+    const coordsString = points.map((p) => `${p.lng},${p.lat}`).join(';');
+    const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`;
+
+    const controller = new AbortController();
+    fetch(osrmUrl, { signal: controller.signal })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.routes && data.routes.length > 0 && data.routes[0].geometry) {
+          const rawCoords = data.routes[0].geometry.coordinates; // [[lon, lat], ...]
+          const formatted: [number, number][] = rawCoords.map((c: [number, number]) => [c[1], c[0]]);
+          setRoadPolylinePositions(formatted);
+        } else {
+          setRoadPolylinePositions(fallbackStraight);
+        }
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') {
+          setRoadPolylinePositions(fallbackStraight);
+        }
+      });
+
+    return () => controller.abort();
+  }, [vanLocation?.lat, vanLocation?.lng, stops]);
 
   return (
     <div className="map-container-wrapper" style={{ height: '100%', width: '100%', borderRadius: '18px', overflow: 'hidden' }}>
@@ -263,6 +309,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         center={centerCoords}
         zoom={14}
         scrollWheelZoom={true}
+        markerZoomAnimation={false}
         style={{ height: '100%', width: '100%' }}
       >
         {/* Google Maps Road Tile Layer - Displays real landmarks, footprints, shops and streets */}
@@ -275,15 +322,29 @@ export const MapComponent: React.FC<MapComponentProps> = ({
           }
         />
 
+        {/* Active Driving Route Path (Following Actual Roads via OSRM) */}
+        {roadPolylinePositions.length >= 2 && (
+          <Polyline
+            positions={roadPolylinePositions}
+            pathOptions={{
+              color: '#1A73E8', // Official Google Maps Navigation Blue
+              weight: 6,
+              opacity: 0.85,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }}
+          />
+        )}
+
         {/* Change map view helper */}
         <ChangeMapView 
           center={mapCenterOverride} 
-          shouldCenter={!!mapCenterOverride} 
           vanLocation={vanLocation}
+          onUserInteract={onClearCenterOverride}
         />
 
         {/* Custom manual map controls (e.g. Center on Van button) */}
-        <MapControls vanLocation={vanLocation} />
+        <MapControls vanLocation={vanLocation} onCenterVan={onClearCenterOverride} />
 
         {/* Click handler helper */}
         <MapClickHandler onMapClick={onAddStop} enabled={enableStopAdding} />
@@ -349,5 +410,3 @@ export const MapComponent: React.FC<MapComponentProps> = ({
     </div>
   );
 };
-
-// Prevent auto-zooming on location update ticks
