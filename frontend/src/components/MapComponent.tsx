@@ -349,5 +349,3 @@ export const MapComponent: React.FC<MapComponentProps> = ({
     </div>
   );
 };
-
-// Prevent auto-zooming on location update ticks

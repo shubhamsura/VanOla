@@ -813,9 +813,3 @@ body.dashboard-active {
 .custom-leaflet-icon {
   transition: transform 2s linear !important;
 }
-
-/* Scroll active dashboard locking fixes */
-
-/* Mobile drawer panel height overrides */
-
-/* Smooth gliding animation transitions for Leaflet markers */
